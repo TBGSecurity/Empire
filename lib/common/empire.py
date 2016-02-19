@@ -9,13 +9,13 @@ menu loops.
 """
 
 # make version for Empire
-VERSION = "1.2"
+VERSION = "1.4.1"
 
 
 from pydispatch import dispatcher
 
 # import time, sys, re, readline
-import sys, cmd, sqlite3, os, hashlib
+import sys, cmd, sqlite3, os, hashlib, traceback
 
 # Empire imports
 import helpers
@@ -31,6 +31,12 @@ import credentials
 import time
 
 
+# custom exceptions used for nested menu navigation
+class NavMain(Exception): pass
+class NavAgents(Exception): pass
+class NavListeners(Exception): pass
+
+
 class MainMenu(cmd.Cmd):
 
     def __init__(self, args=None):
@@ -40,8 +46,6 @@ class MainMenu(cmd.Cmd):
         # globalOptions[optionName] = (value, required, description) 
         self.globalOptions = {}
 
-        self.args = args
-        
         # empty database object
         self.conn = self.database_connect()
 
@@ -105,8 +109,77 @@ class MainMenu(cmd.Cmd):
 
         dispatcher.connect( self.handle_event, sender=dispatcher.Any )
 
-        # start everything up
+        # Main, Agents, or Listeners
+        self.menu_state = "Main"
+
+        # parse/handle any passed command line arguments
+        self.args = args
+        self.handle_args()
+
+        # start everything up normally
         self.startup()
+
+
+    def handle_args(self):
+        """
+        Handle any passed arguments.
+        """
+        
+        if self.args.listener or self.args.stager:
+            # if we're displaying listeners/stagers or generating a stager
+            if self.args.listener:
+                if self.args.listener == 'list':
+                    activeListeners = self.listeners.get_listeners()
+                    messages.display_listeners(activeListeners)
+                else:
+                    activeListeners = self.listeners.get_listeners()
+                    targetListener = [l for l in activeListeners if self.args.listener in l[1]]
+
+                    if targetListener:
+                        targetListener = targetListener[0]
+                        messages.display_listener_database(targetListener)
+                    else:
+                        print helpers.color("\n[!] No active listeners with name '%s'\n" %(self.args.listener))
+
+            else:
+                if self.args.stager == 'list':
+                    print "\nStagers:\n"
+                    print "  Name             Description"
+                    print "  ----             -----------"
+                    for stagerName,stager in self.stagers.stagers.iteritems():
+                        print "  %s%s" % ('{0: <17}'.format(stagerName), stager.info['Description'])
+                    print "\n"
+                else:
+                    stagerName = self.args.stager
+                    try:
+                        targetStager = self.stagers.stagers[stagerName]
+                        menu = StagerMenu(self, stagerName)
+
+                        if self.args.stager_options:
+                            for option in self.args.stager_options:
+                                if '=' not in option:
+                                    print helpers.color("\n[!] Invalid option: '%s'" %(option))
+                                    print helpers.color("[!] Please use Option=Value format\n")
+                                    if self.conn: self.conn.close()
+                                    sys.exit()
+
+                                # split the passed stager options by = and set the appropriate option
+                                optionName, optionValue = option.split('=')
+                                menu.do_set("%s %s" %(optionName, optionValue))
+
+                            # generate the stager
+                            menu.do_generate('')
+
+                        else:
+                            messages.display_stager(stagerName, targetStager)
+
+                    except Exception as e:
+                        print e
+                        print helpers.color("\n[!] No current stager with name '%s'\n" %(stagerName))
+
+            # shutdown the database connection object
+            if self.conn: self.conn.close()
+            sys.exit()
 
 
     def startup(self):
@@ -118,32 +191,6 @@ class MainMenu(cmd.Cmd):
 
         # restart any listeners currently in the database
         self.listeners.start_existing_listeners()
-
-        # display the main title
-        messages.title(VERSION)
-
-        # get active listeners, agents, and loaded modules
-        num_agents = self.agents.get_agents()
-        if(num_agents):
-            num_agents = len(num_agents)
-        else:
-            num_agents = 0
-
-        num_modules = self.modules.modules
-        if(num_modules):
-            num_modules = len(num_modules)
-        else:
-            num_modules = 0
-
-        num_listeners = self.listeners.listeners
-        if(num_listeners):
-            num_listeners = len(num_listeners)
-        else:
-            num_listeners = 0
-
-        print "       " + helpers.color(str(num_modules), "green") + " modules currently loaded\n"
-        print "       " + helpers.color(str(num_listeners), "green") + " listeners currently active\n"
-        print "       " + helpers.color(str(num_agents), "green") + " agents currently active\n\n"
 
         dispatcher.send("[*] Empire starting up...", sender="Empire")
 
@@ -169,6 +216,7 @@ class MainMenu(cmd.Cmd):
         try:
             # set the database connectiont to autocommit w/ isolation level
             self.conn = sqlite3.connect('./data/empire.db', check_same_thread=False)
+            self.conn.text_factory = str
             self.conn.isolation_level = None
             return self.conn
 
@@ -177,41 +225,69 @@ class MainMenu(cmd.Cmd):
             print helpers.color("[!] Please run database_setup.py")
             sys.exit()
 
+    # def preloop(self):
+    #     traceback.print_stack()
 
     def cmdloop(self):
-        try:
-            cmd.Cmd.cmdloop(self)
-
-        # handle those pesky ctrl+c's
-        except KeyboardInterrupt as e:
-
+        while True:
             try:
-                choice = raw_input(helpers.color("\n[>] Exit? [y/N] ", "red"))
-                if choice.lower() != "" and choice.lower()[0] == "y":
-                    self.shutdown()
-                    return True
+                if self.menu_state == "Agents":
+                    self.do_agents("")
+                elif self.menu_state == "Listeners":
+                    self.do_listeners("")
                 else:
-                    self.cmdloop()
-            except KeyboardInterrupt as e:
-                print ""
-                self.cmdloop()
+                    # display the main title
+                    messages.title(VERSION)
 
-        # catch any signaled breaks back to the main menu
-        except StopIteration as e:
-            self.cmdloop()
+                    # get active listeners, agents, and loaded modules
+                    num_agents = self.agents.get_agents()
+                    if(num_agents):
+                        num_agents = len(num_agents)
+                    else:
+                        num_agents = 0
 
-        # if an exit signal is raised anywhere in the code
-        except SystemExit as e:
-            # confirm that we want to exit
-            try:
-                choice = raw_input(helpers.color("[>] Exit Empire? [y/N] ", "red"))
-                if choice.lower() != "" and choice.lower()[0] == "y":
-                    self.shutdown()
-                    return True
-                else:
-                    self.cmdloop()
+                    num_modules = self.modules.modules
+                    if(num_modules):
+                        num_modules = len(num_modules)
+                    else:
+                        num_modules = 0
+
+                    num_listeners = self.listeners.listeners
+                    if(num_listeners):
+                        num_listeners = len(num_listeners)
+                    else:
+                        num_listeners = 0
+
+                    print "       " + helpers.color(str(num_modules), "green") + " modules currently loaded\n"
+                    print "       " + helpers.color(str(num_listeners), "green") + " listeners currently active\n"
+                    print "       " + helpers.color(str(num_agents), "green") + " agents currently active\n\n"
+
+                    cmd.Cmd.cmdloop(self)
+
+            # handle those pesky ctrl+c's
             except KeyboardInterrupt as e:
-                self.cmdloop()
+                self.menu_state = "Main"
+                try:
+                    choice = raw_input(helpers.color("\n[>] Exit? [y/N] ", "red"))
+                    if choice.lower() != "" and choice.lower()[0] == "y":
+                        self.shutdown()
+                        return True
+                    else:
+                        continue
+                except KeyboardInterrupt as e:
+                    continue
+
+            # exception used to signal jumping to "Main" menu
+            except NavMain as e:
+                self.menu_state = "Main"
+
+            # exception used to signal jumping to "Agents" menu
+            except NavAgents as e:
+                self.menu_state = "Agents"
+
+            # exception used to signal jumping to "Listeners" menu
+            except NavListeners as e:
+                self.menu_state = "Listeners"
 
 
     # print a nicely formatted help menu
@@ -241,11 +317,16 @@ class MainMenu(cmd.Cmd):
             EmpireServer    -   the Empire HTTP server
         """
         
-        # if --debug is passed, log out all dispatcher signals
+        # if --debug X is passed, log out all dispatcher signals
         if self.args.debug:
+
             f = open("empire.debug", 'a')
             f.write(helpers.get_datetime() + " " + sender + " : " + signal + "\n")
             f.close()
+
+            if self.args.debug == '2':
+                # if --debug 2, also print the output to the screen
+                print " " + sender + " : " + signal
 
         # display specific signals from the agents.
         if sender == "Agents":
@@ -253,6 +334,9 @@ class MainMenu(cmd.Cmd):
                 print helpers.color(signal)
 
             elif "[!] Agent" in signal and "exiting" in signal:
+                print helpers.color(signal)
+
+            elif "WARNING" in signal or "attempted overwrite" in signal:
                 print helpers.color(signal)
 
             elif "on the blacklist" in signal:
@@ -276,62 +360,67 @@ class MainMenu(cmd.Cmd):
 
     def do_exit(self, line):
         "Exit Empire"
-        raise SystemExit
+        raise KeyboardInterrupt
 
 
     def do_agents(self, line):
         "Jump to the Agents menu."
-        a = AgentsMenu(self)
-        a.cmdloop()
+        try:
+            a = AgentsMenu(self)
+            a.cmdloop()
+        except Exception as e:
+            raise e
 
 
     def do_listeners(self, line):
         "Interact with active listeners."
-        l = ListenerMenu(self)
-        l.cmdloop()
+        try:
+            l = ListenerMenu(self)
+            l.cmdloop()
+        except Exception as e:
+            raise e
 
 
     def do_usestager(self, line):
         "Use an Empire stager."
 
-        parts = line.split(" ")
+        try:
+            parts = line.split(" ")
 
-        if parts[0] not in self.stagers.stagers:
-            print helpers.color("[!] Error: invalid stager module")
+            if parts[0] not in self.stagers.stagers:
+                print helpers.color("[!] Error: invalid stager module")
 
-        elif len(parts) == 1:
-            l = StagerMenu(self, parts[0])
-            l.cmdloop()
-        elif len(parts) == 2:
-            listener = parts[1]
-            if not self.listeners.is_listener_valid(listener):
-                print helpers.color("[!] Please enter a valid listener name or ID")
-            else:
-                self.stagers.set_stager_option('Listener', listener)
+            elif len(parts) == 1:
                 l = StagerMenu(self, parts[0])
                 l.cmdloop()
-        else:
-            print helpers.color("[!] Error in MainMenu's do_userstager()")
-
+            elif len(parts) == 2:
+                listener = parts[1]
+                if not self.listeners.is_listener_valid(listener):
+                    print helpers.color("[!] Please enter a valid listener name or ID")
+                else:
+                    self.stagers.set_stager_option('Listener', listener)
+                    l = StagerMenu(self, parts[0])
+                    l.cmdloop()
+            else:
+                print helpers.color("[!] Error in MainMenu's do_userstager()")
+        
+        except Exception as e:
+            raise e
 
     def do_usemodule(self, line):
         "Use an Empire module."
         if line not in self.modules.modules:
             print helpers.color("[!] Error: invalid module")
         else:
-            l = ModuleMenu(self, line)
-            l.cmdloop()
-
+            try:
+                l = ModuleMenu(self, line)
+                l.cmdloop()
+            except Exception as e:
+                raise e
 
     def do_searchmodule(self, line):
         "Search Empire module names/descriptions."
-
-        searchTerm = line.strip()
-
-        if searchTerm.strip() == "":
-            print helpers.color("[!] Please enter a search term.")
-        else:
-            self.modules.search_modules(searchTerm)
+        self.modules.search_modules(line.strip())
 
 
     def do_creds(self, line):
@@ -450,18 +539,24 @@ class MainMenu(cmd.Cmd):
         else:
             if parts[0].lower() == "ip_whitelist":
                 if parts[1] != "" and os.path.exists(parts[1]):
-                    f = open(parts[1], 'r')
-                    ipData = f.read()
-                    f.close()
-                    self.agents.ipWhiteList = helpers.generate_ip_list(ipData)
+                    try:
+                        f = open(parts[1], 'r')
+                        ipData = f.read()
+                        f.close()
+                        self.agents.ipWhiteList = helpers.generate_ip_list(ipData)
+                    except:
+                        print helpers.color("[!] Error opening ip file %s" %(parts[1]))
                 else:
                     self.agents.ipWhiteList = helpers.generate_ip_list(",".join(parts[1:]))
             elif parts[0].lower() == "ip_blacklist":
                 if parts[1] != "" and os.path.exists(parts[1]):
-                    f = open(parts[1], 'r')
-                    ipData = f.read()
-                    f.close()
-                    self.agents.ipBlackList = helpers.generate_ip_list(ipData)
+                    try:
+                        f = open(parts[1], 'r')
+                        ipData = f.read()
+                        f.close()
+                        self.agents.ipBlackList = helpers.generate_ip_list(ipData)
+                    except:
+                        print helpers.color("[!] Error opening ip file %s" %(parts[1]))
                 else:
                     self.agents.ipBlackList = helpers.generate_ip_list(",".join(parts[1:]))
             else:
@@ -649,6 +744,8 @@ class AgentsMenu(cmd.Cmd):
         agents = self.mainMenu.agents.get_agents()
         messages.display_agents(agents)
 
+    # def preloop(self):
+    #     traceback.print_stack()
     
     # print a nicely formatted help menu
     # stolen/adapted from recon-ng
@@ -672,12 +769,12 @@ class AgentsMenu(cmd.Cmd):
 
     def do_main(self, line):
         "Go back to the main menu."
-        raise StopIteration
+        raise NavMain()
 
 
     def do_exit(self, line):
         "Exit Empire."
-        raise SystemExit
+        raise KeyboardInterrupt
 
 
     def do_list(self, line):
@@ -758,6 +855,8 @@ class AgentsMenu(cmd.Cmd):
 
         if name.lower() == "all":
             self.mainMenu.agents.clear_agent_tasks("all")
+        elif name.lower() == "autorun":
+            self.mainMenu.agents.clear_autoruns()
         else:
             # extract the sessionID and clear the agent tasking
             sessionID = self.mainMenu.agents.get_agent_id(name)
@@ -910,6 +1009,7 @@ class AgentsMenu(cmd.Cmd):
 
         elif parts[0].lower() == "all":
             hours = parts[1]
+            hours = hours.replace("," , "-")
 
             agents = self.mainMenu.agents.get_agents()
 
@@ -927,6 +1027,7 @@ class AgentsMenu(cmd.Cmd):
             sessionID = self.mainMenu.agents.get_agent_id(parts[0])
 
             hours = parts[1]
+            hours = hours.replace("," , "-")
 
             if sessionID and len(sessionID) != 0:
                 #update this agent's field in the database
@@ -1008,8 +1109,7 @@ class AgentsMenu(cmd.Cmd):
 
     def do_listeners(self, line):
         "Jump to the listeners menu."
-        l = ListenerMenu(self.mainMenu)
-        l.cmdloop()
+        raise NavListeners()
 
 
     def do_usestager(self, line):
@@ -1080,7 +1180,7 @@ class AgentsMenu(cmd.Cmd):
     def complete_clear(self, text, line, begidx, endidx):
         "Tab-complete a clear command"
 
-        names = self.mainMenu.agents.get_agent_names() + ["all"]
+        names = self.mainMenu.agents.get_agent_names() + ["all", "autorun"]
         mline = line.partition(' ')[2]
         offs = len(mline) - len(text)
         return [s[offs:] for s in names if s.startswith(mline)]
@@ -1171,6 +1271,8 @@ class AgentMenu(cmd.Cmd):
         if results:
             print "\n" + results.rstrip('\r\n')
 
+    # def preloop(self):
+    #     traceback.print_stack()
 
     def handle_agent_event(self, signal, sender):
         """
@@ -1234,7 +1336,17 @@ class AgentMenu(cmd.Cmd):
 
     def do_main(self, line):
         "Go back to the main menu."
-        raise StopIteration
+        raise NavMain()
+
+
+    def do_listeners(self, line):
+        "Jump to the listeners menu."
+        raise NavListeners()
+
+
+    def do_agents(self, line):
+        "Jump to the Agents menu."
+        raise NavAgents()
 
 
     def do_help(self, *args):
@@ -1341,6 +1453,7 @@ class AgentMenu(cmd.Cmd):
             msg = "Tasked agent to delay sleep/jitter " + str(delay) + "/" + str(jitter)
             self.mainMenu.agents.save_agent_log(self.sessionID, msg)
 
+
     def do_lostlimit(self, line):
         "Task an agent to change the limit on lost agent detection"
 
@@ -1413,6 +1526,7 @@ class AgentMenu(cmd.Cmd):
             self.mainMenu.agents.save_agent_log(self.sessionID, "Tasked agent to get working hours")
 
         else:
+            hours = hours.replace("," , "-")
             # update this agent's information in the database
             self.mainMenu.agents.set_agent_field("working_hours", hours, self.sessionID)
 
@@ -1573,6 +1687,7 @@ class AgentMenu(cmd.Cmd):
                 # strip out profile comments and blank lines
                 profile = [l for l in profile if (not l.startswith("#") and l.strip() != "")]
                 profile = profile[0]
+
             if not profile.strip().startswith("\"/"):
                 print helpers.color("[!] Task URIs in profiles must start with / and be enclosed in quotes!")
             else:
@@ -1821,18 +1936,6 @@ class AgentMenu(cmd.Cmd):
         self.mainMenu.do_creds(line)
 
 
-    def do_listeners(self, line):
-        "Jump to the listeners menu."
-        l = ListenerMenu(self.mainMenu)
-        l.cmdloop()
-
-
-    def do_agents(self, line):
-        "Jump to the Agents menu."
-        a = AgentsMenu(self.mainMenu)
-        a.cmdloop()
-
-
     def complete_psinject(self, text, line, begidx, endidx):
         "Tab-complete psinject option values."
 
@@ -1921,6 +2024,8 @@ class ListenerMenu(cmd.Cmd):
         # display all active listeners on menu startup
         messages.display_listeners(self.mainMenu.listeners.get_listeners())
 
+    # def preloop(self):
+    #     traceback.print_stack()
 
     # print a nicely formatted help menu
     # stolen/adapted from recon-ng
@@ -1939,7 +2044,7 @@ class ListenerMenu(cmd.Cmd):
 
     def do_exit(self, line):
         "Exit Empire."
-        raise SystemExit
+        raise KeyboardInterrupt
 
 
     def do_list(self, line):
@@ -1960,14 +2065,29 @@ class ListenerMenu(cmd.Cmd):
 
     def do_main(self, line):
         "Go back to the main menu."
-        raise StopIteration
+        raise NavMain()
 
 
     def do_set(self, line):
         "Set a listener option."
         parts = line.split(" ")
         if len(parts) > 1:
-            self.mainMenu.listeners.set_listener_option(parts[0], " ".join(parts[1:]))
+
+            if parts[0].lower() == "defaultprofile" and os.path.exists(parts[1]):
+                try:
+                    f = open(parts[1], 'r')
+                    profileDataRaw = f.readlines()
+                    
+                    profileData = [l for l in profileDataRaw if (not l.startswith("#") and l.strip() != "")]
+                    profileData = profileData[0].strip("\"")
+
+                    f.close()
+                    self.mainMenu.listeners.set_listener_option(parts[0], profileData)
+
+                except:
+                    print helpers.color("[!] Error opening profile file %s" %(parts[1]))
+            else:
+                self.mainMenu.listeners.set_listener_option(parts[0], " ".join(parts[1:]))
         else:
             print helpers.color("[!] Please enter a value to set for the option")
 
@@ -2040,8 +2160,7 @@ class ListenerMenu(cmd.Cmd):
 
     def do_agents(self, line):
         "Jump to the Agents menu."
-        a = AgentsMenu(self.mainMenu)
-        a.cmdloop()
+        raise NavAgents()
 
 
     def do_usestager(self, line):
@@ -2112,6 +2231,9 @@ class ListenerMenu(cmd.Cmd):
             return [s[offs:] for s in listenerTypes if s.startswith(mline)]
 
         elif line.split(" ")[1].lower() == "certpath":
+            return helpers.complete_path(text,line,arg=True)
+        
+        elif line.split(" ")[1].lower() == "defaultprofile":
             return helpers.complete_path(text,line,arg=True)
 
         mline = line.partition(' ')[2]
@@ -2185,6 +2307,8 @@ class ModuleMenu(cmd.Cmd):
             agent = self.mainMenu.agents.get_agent_name(agent)
             self.module.options['Agent']['Value'] = agent
 
+    # def preloop(self):
+    #     traceback.print_stack()
 
     def validate_options(self):
         "Make sure all required module options are completed."
@@ -2198,7 +2322,7 @@ class ModuleMenu(cmd.Cmd):
 
         try:
             # if we're running this module for all agents, skip this validation
-            if sessionID.lower() != "all": 
+            if sessionID.lower() != "all" and sessionID.lower() != "autorun": 
                 modulePSVersion = int(self.module.info['MinPSVersion'])
                 agentPSVersion = int(self.mainMenu.agents.get_ps_version(sessionID))
                 # check if the agent/module PowerShell versions are compatible
@@ -2213,7 +2337,7 @@ class ModuleMenu(cmd.Cmd):
         # check if the module needs admin privs
         if self.module.info['NeedsAdmin']:
             # if we're running this module for all agents, skip this validation
-            if sessionID.lower() != "all":
+            if sessionID.lower() != "all" and sessionID.lower() != "autorun":
                 if not self.mainMenu.agents.is_agent_elevated(sessionID):
                     print helpers.color("[!] Error: module needs to run in an elevated context.")
                     return False
@@ -2248,19 +2372,17 @@ class ModuleMenu(cmd.Cmd):
 
     def do_agents(self, line):
         "Jump to the Agents menu."
-        a = AgentsMenu(self.mainMenu)
-        a.cmdloop()
+        raise NavAgents()
 
 
     def do_listeners(self, line):
         "Jump to the listeners menu."
-        l = ListenerMenu(self.mainMenu)
-        l.cmdloop()
+        raise NavListeners()
 
 
     def do_exit(self, line):
         "Exit Empire."
-        raise SystemExit
+        raise KeyboardInterrupt
 
 
     def do_main(self, line):
@@ -2307,7 +2429,7 @@ class ModuleMenu(cmd.Cmd):
 
     def do_main(self, line):
         "Go back to the main menu."
-        raise StopIteration
+        raise NavMain()
 
 
     def do_set(self, line):
@@ -2379,13 +2501,19 @@ class ModuleMenu(cmd.Cmd):
         agentName = self.module.options['Agent']['Value']
         moduleData = self.module.generate()
 
-        # strip all comments from the module
-        moduleData = helpers.strip_powershell_comments(moduleData)
-
         if not moduleData or moduleData == "":
             print helpers.color("[!] Error: module produced an empty script")
             dispatcher.send("[!] Error: module produced an empty script", sender="Empire")
             return
+
+        try:
+            moduleData.decode('ascii')
+        except UnicodeDecodeError:
+            print helpers.color("[!] Error: module source contains non-ascii characters")
+            return
+
+        # strip all comments from the module
+        moduleData = helpers.strip_powershell_comments(moduleData)
 
         taskCommand = ""
 
@@ -2438,6 +2566,12 @@ class ModuleMenu(cmd.Cmd):
 
             except KeyboardInterrupt as e: print ""
 
+        # set the script to be the global autorun
+        elif agentName.lower() == "autorun":
+
+            self.mainMenu.agents.set_autoruns(taskCommand, moduleData)
+            dispatcher.send("[*] Set module " + self.moduleName + " to be global script autorun.", sender="Empire")
+
         else:
             if not self.mainMenu.agents.is_agent_present(agentName):
                 print helpers.color("[!] Invalid agent name.")
@@ -2463,7 +2597,7 @@ class ModuleMenu(cmd.Cmd):
 
         if line.split(" ")[1].lower() == "agent":
             # if we're tab-completing "agent", return the agent names
-            agentNames = self.mainMenu.agents.get_agent_names()
+            agentNames = self.mainMenu.agents.get_agent_names() + ["all", "autorun"]
             endLine = " ".join(line.split(" ")[1:])
             
             mline = endLine.partition(' ')[2]
@@ -2571,7 +2705,7 @@ class StagerMenu(cmd.Cmd):
 
     def do_exit(self, line):
         "Exit Empire."
-        raise SystemExit
+        raise KeyboardInterrupt
 
 
     def do_main(self, line):
@@ -2607,7 +2741,7 @@ class StagerMenu(cmd.Cmd):
 
     def do_main(self, line):
         "Go back to the main menu."
-        raise StopIteration
+        raise NavMain()
 
 
     def do_set(self, line):
@@ -2732,11 +2866,9 @@ class StagerMenu(cmd.Cmd):
 
     def do_agents(self, line):
         "Jump to the Agents menu."
-        a = AgentsMenu(self.mainMenu)
-        a.cmdloop()
+        raise NavAgents()
 
 
     def do_listeners(self, line):
         "Jump to the listeners menu."
-        l = ListenerMenu(self.mainMenu)
-        l.cmdloop()
+        raise NavListeners()
